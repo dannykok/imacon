@@ -6,11 +6,15 @@ package imacon
 // 3. Pane - A container that holds Texts and Images, with layout properties such as padding, margin. Support object alignment within the pane. Support auto-tiling of objects to match the best output size efficiency.
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
+	_ "image/jpeg"
 	"image/png"
+	_ "image/png"
 	"io"
+	"math"
 
 	"github.com/fogleman/gg"
 )
@@ -24,6 +28,7 @@ type Config struct {
 	MaxCanvasHeight int         `json:"max_canvas_height" doc:"The maximum height of the canvas to compose images on."`
 	FgColor         color.Color `json:"fg_color" doc:"The foreground color used for text and shapes."`
 	BgColor         color.Color `json:"bg_color" doc:"The background color of the canvas."`
+	FontSize        float64     `json:"font_size" doc:"The default font size for text rendering."`
 }
 
 func New(cfg Config) *Engine {
@@ -55,6 +60,8 @@ func (e *Engine) Render(scene *Scene) (*Canvas, error) {
 	// NOTE: currently we test using hardcoded size
 	width := e.cfg.MaxCanvasWidth
 	height := e.cfg.MaxCanvasHeight
+
+	// define config values
 	bgColor := e.cfg.BgColor
 	if bgColor == nil {
 		bgColor = color.White
@@ -63,15 +70,21 @@ func (e *Engine) Render(scene *Scene) (*Canvas, error) {
 	if fgColor == nil {
 		fgColor = color.Black
 	}
+	fontSize := e.cfg.FontSize
+	if fontSize == 0 {
+		fontSize = 12
+	}
 
 	ctx := gg.NewContext(width, height)
 	ctx.SetColor(bgColor)
-	ctx.Fill()
 	ctx.Clear()
 
 	ctx.SetColor(fgColor)
+	if err := ctx.LoadFontFace("assets/fonts/JetBrainsMono-Regular.ttf", fontSize); err != nil {
+		return nil, err
+	}
 	pane := scene.Main
-	pane.Draw(ctx)
+	pane.Draw(ctx, float64(width), float64(height))
 	canvas := &Canvas{
 		Width:  width,
 		Height: height,
@@ -91,35 +104,250 @@ type Pane struct {
 	Objects []Tileable // The objects within the pane, which can be TextBlocks or ImageBlocks
 }
 
-func (p *Pane) Draw(ctx *gg.Context) {
+// Shape stores the column count in each row, and the derived padding between tiles and canvas edges (per row)
+// e.g. dim = [3,2,4] means the shape has 3 rows, with 3 columns in the first row, 2 in the second, and 4 in the third.
+type Shape struct {
+	Dim    []int
+	ColPad []float64 // Column padding per row
+}
+
+const (
+	DefaultMinPad      = 10.0
+	DefaultLineSpacing = 1.5
+	DefaultLabelPad    = 3.0
+)
+
+// Return the shape of the tiling objects with a given canvas width and height
+func (p *Pane) Shape(ctx *gg.Context, cw float64, ch float64, minPad float64) Shape {
+	// currently we ignore height constraint
+	dim := []int{}      // dimension
+	cPad := []float64{} // column padding per row
+
+	minPad = math.Max(minPad, DefaultMinPad)
+	accWidth := 0.0
+	colCount := 0
 	for _, obj := range p.Objects {
-		obj.Draw(ctx)
+		// let w, h be the tile size
+		w, _ := obj.IntrinsicSize(ctx, cw, 0)
+		widthDemand := accWidth + w + float64(colCount+2)*minPad
+		if widthDemand > cw {
+			if colCount == 0 {
+				// even a single tile cannot fit, force to add one column
+				accWidth = w
+				colCount = 1
+				cPad = append(cPad, math.Max(math.Trunc((cw-w)/float64(colCount+1)), minPad))
+				dim = append(dim, 1)
+				accWidth = 0
+				colCount = 0
+			} else {
+				// finish the current row
+				cPad = append(cPad, math.Max(math.Trunc((cw-accWidth)/float64(colCount+1)), minPad))
+				dim = append(dim, colCount)
+				// start a new row
+				accWidth = w
+				colCount = 1
+			}
+		} else {
+			accWidth += w
+			colCount++
+		}
 	}
+	if colCount > 0 {
+		cPad = append(cPad, math.Max(math.Trunc((cw-accWidth)/float64(colCount+1)), minPad))
+		dim = append(dim, colCount)
+	}
+
+	s := Shape{Dim: dim, ColPad: cPad}
+	return s
+}
+
+func (p *Pane) Draw(ctx *gg.Context, cw float64, ch float64) {
+
+	// think about what does the auto-tiling process look like here
+	// we need to have the tiles' width and height defined from tileable
+
+	// we use min pad as the lower bound of derived pad
+	shape := p.Shape(ctx, cw, ch, DefaultMinPad)
+	if shape.Dim == nil || shape.ColPad == nil {
+		fmt.Println("Pane.Draw: invalid shape derived")
+		return
+	}
+
+	itemIndex := 0
+	rPad := DefaultMinPad
+	// y := originY + rPad
+	for row, colCount := range shape.Dim {
+		pad := shape.ColPad[row]
+		objects := p.Objects[itemIndex : itemIndex+colCount]
+
+		// we adopt a proportional scaling strategy, corresponding to object's intrinisic size
+		// first calculate the total intrinsic width and height of the objects in this row
+		totalW := 0.0
+
+		for _, obj := range objects {
+			w, _ := obj.IntrinsicSize(ctx, cw, 0)
+			totalW += w
+		}
+
+		// draw each object in this row
+		itemIndex += colCount
+		//x := originX + pad
+		ctx.Push()
+		ctx.Translate(pad, rPad)
+		maxH := 0.0
+		for _, obj := range objects {
+			w, _ := obj.IntrinsicSize(ctx, cw, 0)
+			w = (w / totalW) * (cw - float64(colCount+1)*pad)
+			// calculated height based on the new width
+			_, h := obj.IntrinsicSize(ctx, w, 0)
+			obj.Draw(ctx, w, h)
+			xtrans := math.Trunc(w + pad)
+			ctx.Translate(xtrans, 0)
+			if h > maxH {
+				maxH = h
+			}
+		}
+		ctx.Pop()
+		// y += rPad + maxH
+		if maxH == 0 {
+			panic("Pane.Draw: invalid maxH calculated")
+		}
+		ctx.Translate(0, maxH+rPad)
+	}
+}
+
+func (p *Pane) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) {
+	// we want to calculate the intrinsic size based on the tiling shape
+	shape := p.Shape(ctx, expectedWidth, expectedHeight, DefaultMinPad)
+	totalH := 0.0
+	itemIndex := 0
+	for row, colCount := range shape.Dim {
+		pad := shape.ColPad[row]
+		objects := p.Objects[itemIndex : itemIndex+colCount]
+		itemIndex += colCount
+		maxH := 0.0
+		totalW := 0.0
+		for _, obj := range objects {
+			w, h := obj.IntrinsicSize(ctx, 0, 0)
+			totalW += w
+			if h > maxH {
+				maxH = h
+			}
+		}
+		// scale the height based on the available width
+		scale := (expectedWidth - float64(colCount+1)*pad) / totalW
+		totalH += maxH*scale + DefaultMinPad
+	}
+	return expectedWidth, totalH
+}
+
+type TextBlockOpts struct {
+	TextWrap bool // Whether to wrap text if it exceeds the pane width
 }
 
 type TextBlock struct {
 	// Representation of a plain-text.
 	Text string
+	Opts TextBlockOpts
 }
 
-func (t *TextBlock) Draw(ctx *gg.Context) {
-	ctx.DrawString(t.Text, 0, 0)
+func NewTextBlock(text string, opts TextBlockOpts) *TextBlock {
+	return &TextBlock{Text: text, Opts: opts}
+}
+
+func (t *TextBlock) Draw(ctx *gg.Context, cw float64, ch float64) {
+	if t.Opts.TextWrap == false {
+		ctx.DrawStringAnchored(t.Text, 0, 0, 0, 1)
+	} else {
+		maxWidth := float64(cw)
+		ctx.DrawStringWrapped(t.Text, 0, 0, 0, 0, maxWidth, DefaultLineSpacing, gg.AlignLeft)
+	}
+}
+
+func (t *TextBlock) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) {
+
+	if expectedWidth == 0 {
+		return ctx.MeasureMultilineString(t.Text, DefaultLineSpacing)
+	} else {
+		lines := ctx.WordWrap(t.Text, expectedWidth)
+		maxWidth := 0.0
+		for _, line := range lines {
+			w, _ := ctx.MeasureString(line)
+			if w > maxWidth {
+				maxWidth = w
+			}
+		}
+		totalHeight := float64(len(lines)) * ctx.FontHeight() * DefaultLineSpacing
+		return maxWidth, totalHeight
+	}
 }
 
 type ImageBlock struct {
 	// Representation of an image, with a custom label for identification.
-	Raw   []byte
-	Label string
+	Image image.Image
+	Label *TextBlock
+}
+
+func NewImageBlock(file io.Reader, label string) *ImageBlock {
+	img, _, err := image.Decode(file)
+	if err != nil {
+		fmt.Println("NewImageBlock: failed to load image from bytes:", err)
+		return nil
+	}
+	textblock := NewTextBlock(label, TextBlockOpts{TextWrap: true})
+	return &ImageBlock{Image: img, Label: textblock}
+}
+
+func (i *ImageBlock) Draw(ctx *gg.Context, cw float64, ch float64) {
+	ctx.DrawImageAnchored(i.Image, 0, 0, 0, 0)
+	ctx.Push()
+	ctx.Translate(0, float64(i.Image.Bounds().Dy())+DefaultLabelPad)
+	i.Label.Draw(ctx, cw, ch-float64(i.Image.Bounds().Dy()))
+	ctx.Pop()
+}
+
+func (i *ImageBlock) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) {
+	w := float64(i.Image.Bounds().Dx())
+	h := float64(i.Image.Bounds().Dy())
+	scale := 1.0
+	if expectedWidth == 0 && expectedHeight == 0 {
+		expectedWidth = w
+	}
+	if expectedWidth != 0 && expectedHeight == 0 {
+		// only scale down image but not scale up
+		if expectedWidth > w {
+			expectedWidth = w
+			scale = 1.0
+		} else {
+			scale = expectedWidth / w
+		}
+		_, textHeight := i.Label.IntrinsicSize(ctx, expectedWidth, 0)
+		return expectedWidth, h*scale + textHeight + DefaultLabelPad
+	} else if expectedWidth == 0 && expectedHeight != 0 {
+		scale := expectedHeight / h
+		newWidth := w * scale
+		_, textHeight := i.Label.IntrinsicSize(ctx, newWidth, 0)
+		return newWidth, expectedHeight + textHeight + DefaultLabelPad
+	} else {
+		// both width and height are defined, we scale based on the smaller scale factor to fit within the box
+		scaleW := expectedWidth / w
+		scaleH := expectedHeight / h
+		scale := math.Min(scaleW, scaleH)
+		newWidth := w * scale
+		_, textHeight := i.Label.IntrinsicSize(ctx, newWidth, 0)
+		return newWidth, h*scale + textHeight + DefaultLabelPad
+	}
 }
 
 type Drawable interface {
 	// Drawable defines the behavior of objects that can be drawn onto the scene.
-	Draw(ctx *gg.Context)
+	Draw(ctx *gg.Context, cw float64, ch float64)
 }
 
 type Tileable interface {
 	// Tilable specific the tiling behavior of the pane within the window
 	Drawable
+	IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) // return the intrinsic width and height of the object
 }
 
 func NewScene(main *Pane) *Scene {
