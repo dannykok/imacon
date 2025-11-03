@@ -181,39 +181,43 @@ func (p *Pane) Shape(ctx *gg.Context, cw float64, ch float64, minPad float64) Sh
 }
 
 func (p *Pane) Draw(ctx *gg.Context, cw float64, ch float64) {
-	// we use min pad as the lower bound of derived pad
-	shape := p.Shape(ctx, cw, ch, DefaultMinPad)
+	outerPad := DefaultMinPad
+	ctx.Push()
+	ctx.Translate(outerPad, outerPad)
+
+	adjustedWidth := cw - 2*outerPad
+	adjustedHeight := ch - 2*outerPad
+
+	shape := p.Shape(ctx, adjustedWidth, adjustedHeight, DefaultMinPad)
 	if shape.Dim == nil || shape.ColPad == nil {
 		fmt.Println("Pane.Draw: invalid shape derived")
+		ctx.Pop()
 		return
 	}
 
 	itemIndex := 0
 	rPad := DefaultMinPad
-	// y := originY + rPad
 	for row, colCount := range shape.Dim {
 		pad := shape.ColPad[row]
 		objects := p.Objects[itemIndex : itemIndex+colCount]
 
-		// we adopt a proportional scaling strategy, corresponding to object's intrinisic size
+		// we adopted a proportational scaling strategy, corresponding to object's intrinsic size
 		// first calculate the total intrinsic width and height of the objects in this row
 		totalW := 0.0
 
 		for _, obj := range objects {
-			w, _ := obj.IntrinsicSize(ctx, cw, 0)
+			w, _ := obj.IntrinsicSize(ctx, adjustedWidth, 0)
 			totalW += w
 		}
 
 		// draw each object in this row
 		itemIndex += colCount
-		//x := originX + pad
 		ctx.Push()
 		ctx.Translate(pad, rPad)
 		maxH := 0.0
 		for _, obj := range objects {
-			w, _ := obj.IntrinsicSize(ctx, cw, 0)
-			w = (w / totalW) * (cw - float64(colCount+1)*pad)
-			// calculated height based on the new width
+			w, _ := obj.IntrinsicSize(ctx, adjustedWidth, 0)
+			w = (w / totalW) * (adjustedWidth - float64(colCount+1)*pad)
 			_, h := obj.IntrinsicSize(ctx, w, 0)
 			obj.Draw(ctx, w, h)
 			xtrans := math.Trunc(w + pad)
@@ -223,17 +227,20 @@ func (p *Pane) Draw(ctx *gg.Context, cw float64, ch float64) {
 			}
 		}
 		ctx.Pop()
-		// y += rPad + maxH
 		if maxH == 0 {
 			panic("Pane.Draw: invalid maxH calculated")
 		}
 		ctx.Translate(0, maxH+rPad)
 	}
+	ctx.Pop()
 }
 
 func (p *Pane) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) {
-	// we want to calculate the intrinsic size based on the tiling shape
-	shape := p.Shape(ctx, expectedWidth, expectedHeight, DefaultMinPad)
+	outerPad := DefaultMinPad
+	adjustedWidth := expectedWidth - 2*outerPad
+	adjustedHeight := expectedHeight - 2*outerPad
+
+	shape := p.Shape(ctx, adjustedWidth, adjustedHeight, DefaultMinPad)
 	totalH := 0.0
 	itemIndex := 0
 	for row, colCount := range shape.Dim {
@@ -249,11 +256,10 @@ func (p *Pane) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHei
 				maxH = h
 			}
 		}
-		// scale the height based on the available width
-		scale := (expectedWidth - float64(colCount+1)*pad) / totalW
+		scale := (adjustedWidth - float64(colCount+1)*pad) / totalW
 		totalH += maxH*scale + DefaultMinPad
 	}
-	return expectedWidth, totalH
+	return expectedWidth, totalH + 2*outerPad
 }
 
 type TextBlockOpts struct {
