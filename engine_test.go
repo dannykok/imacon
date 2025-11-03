@@ -14,7 +14,8 @@ func TestEngine_Render(t *testing.T) {
 
 	eng := New(Config{
 		MaxCanvasWidth:  2048,
-		MaxCanvasHeight: 2048,
+		MaxCanvasHeight: 1280,
+		FontSize:        32,
 	})
 
 	sampleJpgBlocks := make([]Tileable, 10)
@@ -22,7 +23,15 @@ func TestEngine_Render(t *testing.T) {
 		sampleJpgFile, err := os.Open("assets/samples/sample_1.jpg")
 		require.NoError(t, err)
 		defer sampleJpgFile.Close()
-		sampleJpgBlocks[i] = NewImageBlock(sampleJpgFile, fmt.Sprintf("Sample Avatar %d", i+1))
+		sampleJpgBlocks[i] = NewImageBlock(sampleJpgFile, fmt.Sprintf("Sample %d", i+1))
+	}
+
+	samplePngBlocks := make([]Tileable, 1)
+	for i := range samplePngBlocks {
+		samplePngFile, err := os.Open("assets/samples/glasses.png")
+		require.NoError(t, err)
+		defer samplePngFile.Close()
+		samplePngBlocks[i] = NewImageBlock(samplePngFile, "Glasses")
 	}
 
 	var sampleImageSets []Tileable
@@ -30,7 +39,7 @@ func TestEngine_Render(t *testing.T) {
 	sampleFile, err := os.Open("assets/samples/sample_1.jpg")
 	require.NoError(t, err)
 	defer sampleFile.Close()
-	sampleImageSets = append(sampleImageSets, NewImageBlock(sampleFile, "Avatar"))
+	sampleImageSets = append(sampleImageSets, NewImageBlock(sampleFile, "Character"))
 
 	sampleFile, err = os.Open("assets/samples/sample_2.jpg")
 	require.NoError(t, err)
@@ -104,6 +113,21 @@ func TestEngine_Render(t *testing.T) {
 			scene: Scene{
 				Main: &Pane{
 					Objects: sampleJpgBlocks[0:8],
+				},
+			},
+		},
+		{
+			name: "Render Jpg and Png",
+			scene: Scene{
+				Main: &Pane{
+					Objects: []Tileable{
+						&Pane{
+							Objects: []Tileable{&TextBlock{Text: "Imacon is a golang module for creating image representation of context data.", Opts: TextBlockOpts{TextWrap: true}}},
+						},
+						sampleJpgBlocks[0],
+						sampleImageSets[1],
+						samplePngBlocks[0],
+					},
 				},
 			},
 		},

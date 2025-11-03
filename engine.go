@@ -19,28 +19,50 @@ import (
 	"github.com/fogleman/gg"
 )
 
+const (
+	DefaultMinPad      = 10.0 // The minimum padding between tiles and canvas edges
+	DefaultLineSpacing = 1.5  // The default line spacing for text rendering
+	DefaultLabelPad    = 3.0  // The default padding between image and its label
+	DefaultMinFontSize = 12.0 // The default minimum font size
+	DefaultMaxFontSize = 32.0 // The default maximum font size
+)
+
 type Engine struct {
 	cfg Config
 }
 
+// Drawable defines the behavior of objects that can be drawn onto the scene.
+type Drawable interface {
+	Draw(ctx *gg.Context, cw float64, ch float64) // Draw the object onto the given context with specified canvas width and height
+}
+
+// Tilable specific the tiling behavior of the pane within the window
+type Tileable interface {
+	Drawable
+	IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) // return the intrinsic width and height of the object
+}
+
+// The configuration options for the Imacon rendering engine.
 type Config struct {
-	MaxCanvasWidth  int         `json:"max_canvas_width" doc:"The maximum width of the canvas to compose images on."`
-	MaxCanvasHeight int         `json:"max_canvas_height" doc:"The maximum height of the canvas to compose images on."`
-	FgColor         color.Color `json:"fg_color" doc:"The foreground color used for text and shapes."`
-	BgColor         color.Color `json:"bg_color" doc:"The background color of the canvas."`
-	FontSize        float64     `json:"font_size" doc:"The default font size for text rendering."`
+	MaxCanvasWidth  int         // The maximum width of the canvas to compose images on.
+	MaxCanvasHeight int         // The maximum height of the canvas to compose images on.
+	FgColor         color.Color // The foreground color used for text and shapes.
+	BgColor         color.Color // The background color of the canvas.
+	FontSize        float64     // The default font size for text rendering.
 }
 
 func New(cfg Config) *Engine {
 	return &Engine{cfg: cfg}
 }
 
+// Canvas represents the rendered image canvas.
 type Canvas struct {
-	Width  int
-	Height int
-	Raw    image.Image
+	Width  int         // The width of the canvas in pixels.
+	Height int         // The height of the canvas in pixels.
+	Raw    image.Image // The raw image data of the canvas.
 }
 
+// ToJpeg encodes the canvas image to JPEG format and writes it to the provided writer.
 func (c *Canvas) ToJpeg(writer io.Writer, options *jpeg.Options) error {
 	if err := jpeg.Encode(writer, c.Raw, options); err != nil {
 		return err
@@ -48,6 +70,7 @@ func (c *Canvas) ToJpeg(writer io.Writer, options *jpeg.Options) error {
 	return nil
 }
 
+// ToPng encodes the canvas image to PNG format and writes it to the provided writer.
 func (c *Canvas) ToPng(writer io.Writer) error {
 	if err := png.Encode(writer, c.Raw); err != nil {
 		return err
@@ -55,8 +78,8 @@ func (c *Canvas) ToPng(writer io.Writer) error {
 	return nil
 }
 
+// Render generates a canvas by rendering the provided scene according to the engine's configuration.
 func (e *Engine) Render(scene *Scene) (*Canvas, error) {
-
 	// NOTE: currently we test using hardcoded size
 	width := e.cfg.MaxCanvasWidth
 	height := e.cfg.MaxCanvasHeight
@@ -94,12 +117,14 @@ func (e *Engine) Render(scene *Scene) (*Canvas, error) {
 	return canvas, nil
 }
 
+// Scene represents the overall image composition, containing panes and their layout properties.
 type Scene struct {
 	Main *Pane // The main pane that holds all the objects to be rendered.
 	// Expect there are some layout properties here in the future
 	// ...
 }
 
+// Pane represents a container that holds multiple tileable objects (TextBlocks or ImageBlocks) and manages their layout.
 type Pane struct {
 	Objects []Tileable // The objects within the pane, which can be TextBlocks or ImageBlocks
 }
@@ -110,12 +135,6 @@ type Shape struct {
 	Dim    []int
 	ColPad []float64 // Column padding per row
 }
-
-const (
-	DefaultMinPad      = 10.0
-	DefaultLineSpacing = 1.5
-	DefaultLabelPad    = 3.0
-)
 
 // Return the shape of the tiling objects with a given canvas width and height
 func (p *Pane) Shape(ctx *gg.Context, cw float64, ch float64, minPad float64) Shape {
@@ -162,10 +181,6 @@ func (p *Pane) Shape(ctx *gg.Context, cw float64, ch float64, minPad float64) Sh
 }
 
 func (p *Pane) Draw(ctx *gg.Context, cw float64, ch float64) {
-
-	// think about what does the auto-tiling process look like here
-	// we need to have the tiles' width and height defined from tileable
-
 	// we use min pad as the lower bound of derived pad
 	shape := p.Shape(ctx, cw, ch, DefaultMinPad)
 	if shape.Dim == nil || shape.ColPad == nil {
@@ -337,17 +352,6 @@ func (i *ImageBlock) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expec
 		_, textHeight := i.Label.IntrinsicSize(ctx, newWidth, 0)
 		return newWidth, h*scale + textHeight + DefaultLabelPad
 	}
-}
-
-type Drawable interface {
-	// Drawable defines the behavior of objects that can be drawn onto the scene.
-	Draw(ctx *gg.Context, cw float64, ch float64)
-}
-
-type Tileable interface {
-	// Tilable specific the tiling behavior of the pane within the window
-	Drawable
-	IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) // return the intrinsic width and height of the object
 }
 
 func NewScene(main *Pane) *Scene {
