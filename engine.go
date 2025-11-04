@@ -6,6 +6,7 @@ package imacon
 // 3. Pane - A container that holds Texts and Images, with layout properties such as padding, margin. Support object alignment within the pane. Support auto-tiling of objects to match the best output size efficiency.
 
 import (
+	"embed"
 	"fmt"
 	"image"
 	"image/color"
@@ -17,7 +18,11 @@ import (
 	"math"
 
 	"github.com/fogleman/gg"
+	"github.com/golang/freetype/truetype"
 )
+
+//go:embed assets/fonts/JetBrainsMono-Regular.ttf
+var embeddedFont embed.FS
 
 const (
 	DefaultMinPad      = 10.0 // The minimum padding between tiles and canvas edges
@@ -103,9 +108,23 @@ func (e *Engine) Render(scene *Scene) (*Canvas, error) {
 	ctx.Clear()
 
 	ctx.SetColor(fgColor)
-	if err := ctx.LoadFontFace("assets/fonts/JetBrainsMono-Regular.ttf", fontSize); err != nil {
-		return nil, err
+
+	fontData, err := embeddedFont.ReadFile("assets/fonts/JetBrainsMono-Regular.ttf")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read embedded font: %w", err)
 	}
+
+	f, err := truetype.Parse(fontData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse font: %w", err)
+	}
+
+	face := truetype.NewFace(f, &truetype.Options{
+		Size: fontSize,
+		DPI:  72,
+	})
+	ctx.SetFontFace(face)
+
 	pane := scene.Main
 	pane.Draw(ctx, float64(width), float64(height))
 	canvas := &Canvas{
