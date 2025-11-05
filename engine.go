@@ -25,11 +25,14 @@ import (
 var embeddedFont embed.FS
 
 const (
-	DefaultMinPad      = 10.0 // The minimum padding between tiles and canvas edges
-	DefaultLineSpacing = 1.5  // The default line spacing for text rendering
-	DefaultLabelPad    = 3.0  // The default padding between image and its label
-	DefaultMinFontSize = 12.0 // The default minimum font size
-	DefaultMaxFontSize = 32.0 // The default maximum font size
+	DefaultOuterPad    = 24.0  // The default outer padding around the canvas
+	DefaultMinPad      = 12.0  // The minimum padding between tiles
+	DefaultLineSpacing = 1.5   // The default line spacing for text rendering
+	DefaultLabelPad    = 3.0   // The default padding between image and its label
+	DefaultMinFontSize = 12.0  // The default minimum font size
+	DefaultMaxFontSize = 32.0  // The default maximum font size
+	DefaultColWidth    = 720.0 // The default column width for tiling
+	DefaultColPad      = 24.0  // The default padding between columns
 )
 
 type Engine struct {
@@ -85,9 +88,6 @@ func (c *Canvas) ToPng(writer io.Writer) error {
 
 // Render generates a canvas by rendering the provided scene according to the engine's configuration.
 func (e *Engine) Render(scene *Scene) (*Canvas, error) {
-	// NOTE: currently we test using hardcoded size
-	width := e.cfg.MaxCanvasWidth
-	height := e.cfg.MaxCanvasHeight
 
 	// define config values
 	bgColor := e.cfg.BgColor
@@ -102,12 +102,8 @@ func (e *Engine) Render(scene *Scene) (*Canvas, error) {
 	if fontSize == 0 {
 		fontSize = 12
 	}
-
-	ctx := gg.NewContext(width, height)
-	ctx.SetColor(bgColor)
-	ctx.Clear()
-
-	ctx.SetColor(fgColor)
+	outerPad := DefaultOuterPad
+	scale := 1.0
 
 	fontData, err := embeddedFont.ReadFile("assets/fonts/JetBrainsMono-Regular.ttf")
 	if err != nil {
@@ -119,11 +115,34 @@ func (e *Engine) Render(scene *Scene) (*Canvas, error) {
 		return nil, fmt.Errorf("failed to parse font: %w", err)
 	}
 
-	face := truetype.NewFace(f, &truetype.Options{
+	fontFace := truetype.NewFace(f, &truetype.Options{
 		Size: fontSize,
 		DPI:  72,
 	})
-	ctx.SetFontFace(face)
+
+	// temp canvas to measure canvas size
+	tempCtx := gg.NewContext(100, 100)
+	tempCtx.SetFontFace(fontFace)
+	width, height := scene.canvasSize(tempCtx, outerPad)
+
+	// measure the scale factor used to fit within max canvas size
+	if width > e.cfg.MaxCanvasWidth {
+		scale = float64(e.cfg.MaxCanvasWidth) / float64(width)
+		width = e.cfg.MaxCanvasWidth
+	}
+	if height > e.cfg.MaxCanvasHeight {
+		scale = math.Min(scale, float64(e.cfg.MaxCanvasHeight)/float64(height))
+		height = e.cfg.MaxCanvasHeight
+	}
+
+	ctx := gg.NewContext(width, height)
+	ctx.SetColor(bgColor)
+	ctx.Clear()
+	ctx.ScaleAbout(scale, scale, 0, 0)
+	ctx.SetColor(fgColor)
+
+	ctx.SetFontFace(fontFace)
+	ctx.Translate(outerPad, outerPad)
 
 	pane := scene.Main
 	pane.Draw(ctx, float64(width), float64(height))
@@ -143,142 +162,209 @@ type Scene struct {
 	// ...
 }
 
+func (s *Scene) canvasSize(ctx *gg.Context, outerPad float64) (int, int) {
+	if outerPad == 0 {
+		outerPad = DefaultOuterPad
+	}
+	w, h := s.Main.IntrinsicSize(ctx, 0, 0)
+	return int(w + outerPad*2), int(h + outerPad*2)
+}
+
 // Pane represents a container that holds multiple tileable objects (TextBlocks or ImageBlocks) and manages their layout.
 type Pane struct {
-	Objects []Tileable // The objects within the pane, which can be TextBlocks or ImageBlocks
+	Objects      []Tileable // The objects within the pane, which can be TextBlocks or ImageBlocks
+	PlannedShape *Shape     // The planned shape of the pane after layout calculation
+	ColWidth     float64    // The fixed column width for tiling
+	ColPad       float64    // The padding between columns
+	RowPad       float64    // The padding between tiles in a column
 }
 
-// Shape stores the column count in each row, and the derived padding between tiles and canvas edges (per row)
-// e.g. dim = [3,2,4] means the shape has 3 rows, with 3 columns in the first row, 2 in the second, and 4 in the third.
+func NewPane(objects []Tileable, colWidth float64, colPad float64, rowPad float64) *Pane {
+	if colWidth == 0 {
+		colWidth = DefaultColWidth
+	}
+	if colPad == 0 {
+		colPad = DefaultColPad
+	}
+	if rowPad == 0 {
+		rowPad = DefaultMinPad
+	}
+	return &Pane{
+		Objects:  objects,
+		ColWidth: colWidth,
+		ColPad:   colPad,
+		RowPad:   rowPad,
+	}
+}
+
+func NewPaneWithShape(Shape *Shape, colWidth float64, colPad float64, rowPad float64) *Pane {
+	if colWidth == 0 {
+		colWidth = DefaultColWidth
+	}
+	if colPad == 0 {
+		colPad = DefaultColPad
+	}
+	if rowPad == 0 {
+		rowPad = DefaultMinPad
+	}
+	return &Pane{
+		PlannedShape: Shape,
+		ColWidth:     colWidth,
+		ColPad:       colPad,
+		RowPad:       rowPad,
+	}
+}
+
+// Column represents a single column in the pane, containing multiple tileable objects. The column width will follow Pane.ColWidth when rendered.
+type Column struct {
+	Objects []Tileable
+}
+
+func (c Column) Height(ctx *gg.Context, colWidth float64, rowPad float64) float64 {
+	totalH := 0.0
+	for _, obj := range c.Objects {
+		_, h := obj.IntrinsicSize(ctx, colWidth, 0)
+		totalH += h
+	}
+	totalH += rowPad * float64(len(c.Objects)-1)
+	return totalH
+}
+
+// Shape stores the layout shape of the pane in terms of columns and rows. It's a temporary view of underlying objects calculated using the greedy algorithm to fit into the best canvas size.
 type Shape struct {
-	Dim    []int
-	ColPad []float64 // Column padding per row
+	Columns []Column // The columns in the pane
 }
 
-// Return the shape of the tiling objects with a given canvas width and height
-func (p *Pane) Shape(ctx *gg.Context, cw float64, ch float64, minPad float64) Shape {
-	// currently we ignore height constraint
-	dim := []int{}      // dimension
-	cPad := []float64{} // column padding per row
+func NewShape(colCount int) *Shape {
+	return &Shape{
+		Columns: make([]Column, colCount),
+	}
+}
 
-	minPad = math.Max(minPad, DefaultMinPad)
-	accWidth := 0.0
-	colCount := 0
-	for _, obj := range p.Objects {
-		// let w, h be the tile size
-		w, _ := obj.IntrinsicSize(ctx, cw, 0)
-		widthDemand := accWidth + w + float64(colCount+2)*minPad
-		if widthDemand > cw {
-			if colCount == 0 {
-				// even a single tile cannot fit, force to add one column
-				accWidth = w
-				colCount = 1
-				cPad = append(cPad, math.Max(math.Trunc((cw-w)/float64(colCount+1)), minPad))
-				dim = append(dim, 1)
-				accWidth = 0
-				colCount = 0
-			} else {
-				// finish the current row
-				cPad = append(cPad, math.Max(math.Trunc((cw-accWidth)/float64(colCount+1)), minPad))
-				dim = append(dim, colCount)
-				// start a new row
-				accWidth = w
-				colCount = 1
-			}
-		} else {
-			accWidth += w
-			colCount++
+func NewShapeWithObjects(columns []Column) *Shape {
+	return &Shape{
+		Columns: columns,
+	}
+}
+
+// TileProxy is a placeholder tileable object used for layout calculations, with pre-calculated size.
+type TileProxy struct {
+	Object Tileable // The actual tileable object being proxied
+	Size   Size     // The pre-calculated size of the tile
+}
+
+func (t *TileProxy) Draw(ctx *gg.Context, cw float64, ch float64) {
+	t.Object.Draw(ctx, cw, ch)
+}
+
+func (t *TileProxy) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) {
+	return t.Size.Width, t.Size.Height
+}
+
+type Size struct {
+	Width  float64
+	Height float64
+}
+
+// Calculate and return the shape of the column layout of the pane.
+// The algorithm finds the smallest footprint of canvas that can fit all objects in the pane.
+func (p *Pane) Shape(ctx *gg.Context) (Shape, Size) {
+
+	// we try to optimize the layout with the smallest bounding box, as well as lowest aspect ratio difference to 1:1
+	maxCol := len(p.Objects) // maximum number of columns possible
+	areaDotAr := math.MaxFloat64
+	var bestShape *Shape
+	var bestSize Size
+
+	// Create proxies
+	proxies := make([]Tileable, len(p.Objects))
+	for i, obj := range p.Objects {
+		w, h := obj.IntrinsicSize(ctx, p.ColWidth, 0)
+		proxies[i] = &TileProxy{Object: obj, Size: Size{Width: w, Height: h}}
+	}
+
+	for colCount := 1; colCount <= maxCol; colCount++ {
+		s := NewShape(colCount)
+		deriveShape(ctx, s, proxies, p.ColWidth, p.RowPad)
+
+		w, h := canvasSize(ctx, s, p.ColWidth, p.ColPad, p.RowPad)
+		area := w * h
+		ar := math.Max(w/h, h/w)
+		if area*ar < areaDotAr {
+			bestShape = s
+			bestSize = Size{Width: w, Height: h}
+			areaDotAr = area * ar
 		}
 	}
-	if colCount > 0 {
-		cPad = append(cPad, math.Max(math.Trunc((cw-accWidth)/float64(colCount+1)), minPad))
-		dim = append(dim, colCount)
-	}
 
-	s := Shape{Dim: dim, ColPad: cPad}
-	return s
+	return *bestShape, bestSize
+}
+
+// Greedy algorithm to push tiles into the shape's columns based on the given column width
+func deriveShape(ctx *gg.Context, s *Shape, t []Tileable, colWidth float64, rowPad float64) {
+	colCount := len(s.Columns)
+	for _, tile := range t {
+		minHeightCol := 0
+		minHeight := math.MaxFloat64
+		for colIndex := range colCount {
+			h := s.Columns[colIndex].Height(ctx, colWidth, rowPad)
+			if h < minHeight {
+				minHeight = h
+				minHeightCol = colIndex
+			}
+		}
+		s.Columns[minHeightCol].Objects = append(s.Columns[minHeightCol].Objects, tile)
+	}
+}
+
+// Calculate the canvas size based on the layout of given shape.
+func canvasSize(ctx *gg.Context, shape *Shape, colWidth float64, colPad float64, rowPad float64) (float64, float64) {
+	colCount := len(shape.Columns)
+	totalW := float64(colCount)*colWidth + float64(colCount-1)*colPad
+	maxH := 0.0
+	for colIndex := range colCount {
+		h := shape.Columns[colIndex].Height(ctx, colWidth, rowPad)
+		if h > maxH {
+			maxH = h
+		}
+	}
+	return totalW, maxH
+}
+
+// Draw the pane onto the given context based on the provided shape.
+func (p *Pane) DrawShape(ctx *gg.Context, shape Shape) {
+	rPad := DefaultMinPad
+	for colCount, column := range shape.Columns {
+		ctx.Push()
+		translateX := p.ColWidth*float64(colCount) + p.ColPad*float64(colCount)
+		ctx.Translate(translateX, 0)
+		for _, obj := range column.Objects {
+			w, h := obj.IntrinsicSize(ctx, p.ColWidth, 0)
+			obj.Draw(ctx, w, h)
+			ctx.Translate(0, h+rPad)
+		}
+		ctx.Pop()
+	}
 }
 
 func (p *Pane) Draw(ctx *gg.Context, cw float64, ch float64) {
-	outerPad := DefaultMinPad
-	ctx.Push()
-	ctx.Translate(outerPad, outerPad)
-
-	adjustedWidth := cw - 2*outerPad
-	adjustedHeight := ch - 2*outerPad
-
-	shape := p.Shape(ctx, adjustedWidth, adjustedHeight, DefaultMinPad)
-	if shape.Dim == nil || shape.ColPad == nil {
-		fmt.Println("Pane.Draw: invalid shape derived")
-		ctx.Pop()
-		return
+	if p.PlannedShape != nil {
+		p.DrawShape(ctx, *p.PlannedShape)
+	} else {
+		shape, _ := p.Shape(ctx)
+		p.PlannedShape = &shape
+		p.DrawShape(ctx, shape)
 	}
-
-	itemIndex := 0
-	rPad := DefaultMinPad
-	for row, colCount := range shape.Dim {
-		pad := shape.ColPad[row]
-		objects := p.Objects[itemIndex : itemIndex+colCount]
-
-		// we adopted a proportational scaling strategy, corresponding to object's intrinsic size
-		// first calculate the total intrinsic width and height of the objects in this row
-		totalW := 0.0
-
-		for _, obj := range objects {
-			w, _ := obj.IntrinsicSize(ctx, adjustedWidth, 0)
-			totalW += w
-		}
-
-		// draw each object in this row
-		itemIndex += colCount
-		ctx.Push()
-		ctx.Translate(pad, rPad)
-		maxH := 0.0
-		for _, obj := range objects {
-			w, _ := obj.IntrinsicSize(ctx, adjustedWidth, 0)
-			w = (w / totalW) * (adjustedWidth - float64(colCount+1)*pad)
-			_, h := obj.IntrinsicSize(ctx, w, 0)
-			obj.Draw(ctx, w, h)
-			xtrans := math.Trunc(w + pad)
-			ctx.Translate(xtrans, 0)
-			if h > maxH {
-				maxH = h
-			}
-		}
-		ctx.Pop()
-		if maxH == 0 {
-			panic("Pane.Draw: invalid maxH calculated")
-		}
-		ctx.Translate(0, maxH+rPad)
-	}
-	ctx.Pop()
 }
 
 func (p *Pane) IntrinsicSize(ctx *gg.Context, expectedWidth float64, expectedHeight float64) (float64, float64) {
-	outerPad := DefaultMinPad
-	adjustedWidth := expectedWidth - 2*outerPad
-	adjustedHeight := expectedHeight - 2*outerPad
-
-	shape := p.Shape(ctx, adjustedWidth, adjustedHeight, DefaultMinPad)
-	totalH := 0.0
-	itemIndex := 0
-	for row, colCount := range shape.Dim {
-		pad := shape.ColPad[row]
-		objects := p.Objects[itemIndex : itemIndex+colCount]
-		itemIndex += colCount
-		maxH := 0.0
-		totalW := 0.0
-		for _, obj := range objects {
-			w, h := obj.IntrinsicSize(ctx, 0, 0)
-			totalW += w
-			if h > maxH {
-				maxH = h
-			}
-		}
-		scale := (adjustedWidth - float64(colCount+1)*pad) / totalW
-		totalH += maxH*scale + DefaultMinPad
+	if p.PlannedShape != nil {
+		return canvasSize(ctx, p.PlannedShape, p.ColWidth, p.ColPad, p.RowPad)
+	} else {
+		shape, size := p.Shape(ctx)
+		p.PlannedShape = &shape
+		return size.Width, size.Height
 	}
-	return expectedWidth, totalH + 2*outerPad
 }
 
 type TextBlockOpts struct {
@@ -328,21 +414,30 @@ type ImageBlock struct {
 	Label *TextBlock
 }
 
-func NewImageBlock(file io.Reader, label string) *ImageBlock {
+func NewImageBlock(file io.Reader, label string) (*ImageBlock, error) {
 	img, _, err := image.Decode(file)
 	if err != nil {
 		fmt.Println("NewImageBlock: failed to load image from bytes:", err)
-		return nil
+		return nil, err
 	}
 	textblock := NewTextBlock(label, TextBlockOpts{TextWrap: true})
-	return &ImageBlock{Image: img, Label: textblock}
+	return &ImageBlock{Image: img, Label: textblock}, nil
 }
 
 func (i *ImageBlock) Draw(ctx *gg.Context, cw float64, ch float64) {
-	ctx.DrawImageAnchored(i.Image, 0, 0, 0, 0)
+	// scale down image if necessary
 	ctx.Push()
-	ctx.Translate(0, float64(i.Image.Bounds().Dy())+DefaultLabelPad)
-	i.Label.Draw(ctx, cw, ch-float64(i.Image.Bounds().Dy()))
+	ctx.Push()
+	scale := 1.0
+	if float64(i.Image.Bounds().Dx()) > cw {
+		scale = cw / float64(i.Image.Bounds().Dx())
+		ctx.Scale(scale, scale)
+	}
+	ctx.DrawImageAnchored(i.Image, 0, 0, 0, 0)
+	ctx.Pop()
+	imageHeight := float64(i.Image.Bounds().Dy()) * scale
+	ctx.Translate(0, imageHeight+DefaultLabelPad)
+	i.Label.Draw(ctx, cw, ch-imageHeight-DefaultLabelPad)
 	ctx.Pop()
 }
 
